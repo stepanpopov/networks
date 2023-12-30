@@ -2,7 +2,11 @@ const list = document.getElementById('list');
 const startButton = document.getElementById('start');
 const finishButton = document.getElementById('finish');
 
-let streamIntervalId = 0;
+const SOCKET_ID_KEY = 'socketID';
+const STREAM_ID_KEY = 'streamID';
+
+const SUBSCRIBE_AGAIN_INTERVAL = 3000;
+const SUBSCRIBE_ABORT_TIMEOUT = 1000;
 
 
 const handshake = async () => {
@@ -43,7 +47,25 @@ const handshake = async () => {
     return { socketID, ACK: SEQ + 1}
 };
 
+const finish = async (socketID) => {
+    const response = await fetch('/finish', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ socketID }),
+    });
+
+    if (response.status !== 200) {
+        console.error('Ошибка при выполнении запроса, статус', response.status);
+        throw new Error('Не получилось подключиться к серверу');
+    }
+}
+
 const subscribe = async (socketID) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), SUBSCRIBE_ABORT_TIMEOUT);
+
     const response = await fetch('/subscribe', {
         method: 'POST',
         headers: {
@@ -51,6 +73,7 @@ const subscribe = async (socketID) => {
         },
         body: JSON.stringify({ socketID }),
     });
+    clearTimeout(timeoutId)
 
     if (response.status !== 200 ) {
         const { error } = await response.json();
@@ -69,6 +92,7 @@ const sendACK = async (socketID, ACK) => {
         },
         body: JSON.stringify({ socketID, ACK }),
     });
+    console.log('SENT ACK!')
 
     if (resp.status != 200) {
         const { error } = await resp.json();
@@ -76,9 +100,9 @@ const sendACK = async (socketID, ACK) => {
     }
 }
 
-const loosingtMessage = (probability) => (Math.random() <= probability)
+const loosingMessage = (probability) => (Math.random() <= probability)
 
-const seq_windows = [];
+const messagesStorage = new Set();
 
 const startStream = async (socketID, start_ack) => {
     let ack = start_ack;
@@ -86,54 +110,73 @@ const startStream = async (socketID, start_ack) => {
     const intervalId = setInterval(async () => {
         try {
             const { message, SEQ } = await subscribe(socketID);
-            console.log("CUR ACK:", ack)
-            console.log("CUR SEQ:", SEQ)
-            if (loosingtMessage(0.001)) {
+            
+            if (loosingMessage(0.1)) {
                 showMessage('потеряли сообщение')
                 return
             }
             
             if (ack > SEQ) {
                 showMessage('получили дубликат')
-                sendACK(socketID, ack);
                 return
             }
 
-            // TODO: если получили seq с пропусками
-            console.log(message);
-            showMessage(message + ', SEQ: ' + SEQ);
+            if (ack < SEQ) {
+                showMessage('получили сообщение для будущего')
+                messagesStorage.add([message, SEQ]);
 
-
-            for (let i = 0; i < seq_windows.length; i++) {
-                if (SEQ === seq_windows[i][0] && SEQ + message.length === seq_windows[i][1]) {
-                    if (i === 0 && seq_windows.length === 1) ack = seq_windows[0][1]
-                    if (i === 0 && seq_windows.length > 1) ack = seq_windows[1][0]
-                    seq_windows.splice(i, 1)
-                }
-
-                // TODO: we can cover only a part of seq window
+                return
             }
 
-            console.log("CURRENT CLIENT ACK FOR SERVER MESSAGES: ", ack)
+            
+            const last_ack = ack
+            ack = SEQ + message.length
 
-            if (SEQ === ack) {
-                ack = SEQ + message.length
-                sendACK(socketID, ack);
-            } else if (SEQ < ack) {
-                sendACK(socketID, ack);
-            } else {
-                seq_windows.push([SEQ, SEQ + message.length])
-
-                // TODO: we can get seq windows in a seq window
-                seq_windows.sort((a, b) => (a[0] < b[0]))
+            if (last_ack === SEQ) {
+                // preventing dublicates
+                showMessage(message + ', SEQ: ' + SEQ);
             }
             
+            await sendACK(socketID, ack);
+
+            const messages = [...messagesStorage].sort((a, b) => (a[1] < b[1]))
+            if (messages.length !== 0 && messages[0][1] <= ack) {
+                const last_ack = ack
+                ack = SEQ + message.length
+
+                if (last_ack === SEQ) {
+                    // preventing dublicates
+                    showMessage(message + ', SEQ: ' + messages[0][1]);
+                }
+                
+                messagesStorage.delete(messages[0]);
+            }
+            for (let i = 1; i < messages.length; i++) {
+                if (messages[i - 1][1] === messages[i][1]) {
+                    messagesStorage.delete(messages[i])
+                    continue;
+                }
+
+                if (messages[i][1] <= ack) {
+                    const last_ack = ack
+                    ack = SEQ + message.length
+
+                    if (last_ack === SEQ) {
+                        // preventing dublicates
+                        showMessage(message + ', SEQ: ' + messages[0][1]);
+                    }
+                    
+                    messagesStorage.delete(messages[i]);    
+                } else {
+                    break;
+                }
+            }
         } catch (e) {
             showMessage(e.message);
             clearInterval(intervalId)
             console.log(e);
         }
-    }, 1000)
+    }, SUBSCRIBE_AGAIN_INTERVAL)
     return intervalId
 }
 
@@ -149,17 +192,27 @@ const startConnectToServer = async () => {
   
     try {
         const { socketID, ACK } = await handshake();
-        console.log('aaa')
-        streamIntervalId = await startStream(socketID, ACK);
+        sessionStorage.setItem(SOCKET_ID_KEY, socketID);
+
+        const streamIntervalId = await startStream(socketID, ACK);
+        sessionStorage.setItem(STREAM_ID_KEY, streamIntervalId);
     } catch (e) {
         console.log(e);
         showMessage(e.message)
     }
 }
 
-const finishConnectToServer = () => {
+const finishConnectToServer = async () => {
   startButton.disabled = false;
   finishButton.disabled = true;
   
-  clearInterval(streamIntervalId)
+  const streamIntervalId = sessionStorage.getItem(STREAM_ID_KEY);
+  if (streamIntervalId) {
+    clearInterval(streamIntervalId)
+  }
+
+  const socketID = sessionStorage.getItem(SOCKET_ID_KEY);
+  if (socketID) {
+    await finish(socketID)
+  }
 }

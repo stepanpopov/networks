@@ -1,86 +1,19 @@
 const path = require('path')
 const { v4: uuidv4 } = require('uuid');
 const express = require("express");
-
-const EventEmitter = require('events');
-
-class BufferedEventEmitter extends EventEmitter {
-    constructor() {
-        super();
-        this.buffer = new Map();
-    }
-
-    once(eventName, callback) {
-        let events = this.buffer.get(eventName)
-        console.log("EVENTS: ", events)
-
-        if (events === void 0 || events.length === 0) {
-            return super.once(eventName, callback)
-        }
-        console.log("EVENTS: not empty")
-
-        const lastEventArgs = events[0]
-        this.buffer.set(eventName, events.slice(1))
-
-        return super.prependOnceListener(eventName, callback)._emit(eventName, ...lastEventArgs)
-    }
-
-    once_block(interval, eventName, callback) {
-        let block = true;
-        let args = [];
-        this.once(eventName, (...callback_args) => {
-            args = callback_args
-            console.log("before callback")
-            callback(...callback_args)
-            console.log("after callback")
-            block = false
-        })
-
-        console.log("before wait")
-        return new Promise((resolve) => {
-            const intervalId = setInterval(() => {
-                if (block === false) {
-                  clearInterval(intervalId);
-                  resolve(args);
-                }
-              }, interval);
-        })
-    }
-
-    emit(eventName, ...args) {
-        console.log("in emit")
-        if (this.listenerCount(eventName).length === 0) {
-            console.log("long emit")
-            let events = this.buffer.get(eventName)
-            console.log(events)
-            if (events === void 0) {
-                events = []
-            } 
-            this.buffer.set(eventName, [...events, args])
-            return false
-        } else {
-            console.log("fast emit")
-            return super.emit(eventName, ...args);
-        }
-    }
-
-    _emit(eventName, ...args) {
-        console.log("_emit called")
-        this.emit(eventName, ...args)
-        return this
-    }
-}
+var message_store = require("./message_store")
 
 const app = express();
 app.use(express.json());
 
 const port = 8888;
 
-const SEND_MESSAGE_INTERVAL = 1000;
-const CHECK_MESSAGE_INTERVAL = 100;
-const SEND_AGAIN_MESSAGE_TIMEOUT = 20000;
+const SEND_MESSAGE_INTERVAL = 4000;
+const CHECK_MESSAGE_INTERVAL = 2000;
+const SEND_AGAIN_MESSAGE_TIMEOUT = 3000;
 const BUFFER_SIZE = 100; // len of not accepted symbols
-const FAIL_TIMES_TO_RESET_CONNECTION = 5; // соединение прерывается после SEND_AGAIN_MESSAGE_TIMEOUT * FAIL_TIMES_TO_RESET_CONNECTION раз
+const FAIL_TIMES_TO_RESET_CONNECTION = 20; // соединение прерывается после SEND_AGAIN_MESSAGE_TIMEOUT * FAIL_TIMES_TO_RESET_CONNECTION раз
+const messagesToSent = ['я люблю рип', 'я не люблю рип', 'люблю сети']
 
 const STATE = {
     SYN_RECEIVED: 0,
@@ -88,10 +21,16 @@ const STATE = {
     CLOSED: 2, 
 }
 
-const getRandomSeq = () => {
-    min = 0;
-    max = 1000;
+const getRandom = (min, max) => {
     return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+const getRandomSeq = () => {
+    return getRandom(0, 1000)
+}
+
+const randomChoice = (array) => {
+    return array[getRandom(0, array.length - 1)]
 }
 
 app.use(express.static(path.join(__dirname, '../frontend')));
@@ -102,7 +41,7 @@ app.get('/', (req, res) => {
 
 const sockets = {};
 
-const messageEmitter = new BufferedEventEmitter();
+const messageStore = new message_store.MessageStore();
 
 app.post("/handshake", (req, res) => {
     try {
@@ -134,54 +73,66 @@ app.post("/handshake", (req, res) => {
     }
 });
 
-app.post("/subscribe", (req, res) => {
-    const { socketID } = req.body;
-    if (sockets[socketID] === void 0) {
-        res.status(400).json({ error: "Не существует такого соединения" })
-        return
+app.post("/finish", (req, res) => {
+    try {
+        const { socketID } = req.body;
+        sockets[socketID] = undefined
+        res.sendStatus(200);
+    } catch (e) {
+        res.status(400).json({ error: e.message })
     }
-    if (sockets[socketID].state !== STATE.ESTABILISHED) {
-        res.status(400).json({ error: "Соединение не установлено" })
-        return
-    }
+})
 
-    if (sockets[socketID].fails === FAIL_TIMES_TO_RESET_CONNECTION) {
-        sockets[socketID] = undefined;
-        res.status(400).json({ error: "Таймаут, установите соединение заново" })
-        return
-    }
+app.post("/subscribe", async (req, res) => {
+    try {
+        const { socketID } = req.body;
+        if (sockets[socketID] === void 0 || sockets[socketID].state !== STATE.ESTABILISHED) {
+            res.status(400).json({ error: "Соединение не установлено" })
+            return
+        }
 
-    messageEmitter.once_block(CHECK_MESSAGE_INTERVAL, socketID, (message, seq) => {
-        // TODO: забыть отправить
+        if (sockets[socketID].fails === FAIL_TIMES_TO_RESET_CONNECTION) {
+            sockets[socketID] = undefined;
+            res.status(400).json({ error: "Таймаут, установите соединение заново" })
+            return
+        }
+
+        const [message, seq] = await messageStore
+            .getMessage(socketID, CHECK_MESSAGE_INTERVAL);
+
+        if (sockets[socketID].ack >= seq + message.length) {
+            return
+        }
+
+        console.log("sent msg seq: %d, ack: %d", seq, sockets[socketID].ack)
         res.json({ message, SEQ: seq })
-    })
-    .then((args) => {
-        const message = args[0]
-        const seq = args[1]
-        console.log("THEN")
-        console.log(message, seq)
-        setTimeout(() => {
+
+        setTimeout(async (socketID, message, seq) => {
             if (sockets[socketID] === void 0) {
                 return
             }
             
-            console.log("SEQ ACK %d %d", seq, sockets[socketID].ack)
             if (sockets[socketID].ack >= seq + message.length) {
                 sockets[socketID].fails = 0;
                 return
             }
-    
+
             sockets[socketID].fails += 1;
-    
-            messageEmitter.emit(socketID, message, seq)
-            console.log("call emit for retry send msg")
-        }, SEND_AGAIN_MESSAGE_TIMEOUT);
-    });
+
+            await messageStore.addMessage(socketID, message, seq)
+            
+            console.log("saved msg for retry send msg, seq: %d", seq)
+        }, SEND_AGAIN_MESSAGE_TIMEOUT, socketID, message, seq)
+    } catch (e) {
+        res.status(400).json({ error: e.message })
+    }
+
 });
 
 
 app.post("/ack", (req, res) => {
     const { ACK, socketID } = req.body;
+    console.log('GOT ACK: %d', ACK)
     const cur_ack = sockets[socketID].ack;
     sockets[socketID].ack = (cur_ack < ACK ? ACK : cur_ack);
     res.sendStatus(200);
@@ -193,12 +144,8 @@ app.listen(port, () => {
 
 // Functions that sends messages to the clients
 setInterval(() => {
-    console.log("listeners: %d", messageEmitter.listenerCount())
-
     for (const socketID in sockets) {
-        console.log("listeners for %s: %d", socketID, messageEmitter.listenerCount())
-        if (sockets[socketID].state !== STATE.ESTABILISHED) {
-            console.log("%d not estabilished", socketID)
+        if (sockets[socketID] === void 0 || sockets[socketID].state !== STATE.ESTABILISHED) {
             return
         }
 
@@ -206,12 +153,11 @@ setInterval(() => {
         const cur_ack = sockets[socketID].ack;
 
         if (cur_seq - cur_ack > BUFFER_SIZE) {
-            console.log("cur_seq - cur_ack > 100")
-            continue
+            return;
         }
         
-        const message = 'Я ЛЮБЛЮ РИП';
-        messageEmitter.emit(socketID, message, cur_seq)
+        const message = randomChoice(messagesToSent);
+        messageStore.addMessage(socketID, message, cur_seq)
         sockets[socketID].seq = cur_seq + message.length
     }
 }, SEND_MESSAGE_INTERVAL);
