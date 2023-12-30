@@ -7,6 +7,7 @@ const STREAM_ID_KEY = 'streamID';
 
 const SUBSCRIBE_AGAIN_INTERVAL = 3000;
 const SUBSCRIBE_ABORT_TIMEOUT = 1000;
+const LOSS_PROBABILITY = 0.1
 
 
 const handshake = async () => {
@@ -111,7 +112,7 @@ const startStream = async (socketID, start_ack) => {
         try {
             const { message, SEQ } = await subscribe(socketID);
             
-            if (loosingMessage(0.1)) {
+            if (loosingMessage(LOSS_PROBABILITY)) {
                 showMessage('потеряли сообщение')
                 return
             }
