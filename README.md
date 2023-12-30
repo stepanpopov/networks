@@ -1,2 +1,4 @@
 # networks
-long-polling
+
+Realization of TCP over Long Polling HTTP Requests.
+
